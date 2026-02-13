@@ -27,6 +27,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 # Runtime dependency notes:
 # pip install biopython requests
 from Bio import Entrez, SeqIO
+from Bio.Blast import NCBIWWW, NCBIXML
 from Bio.SeqUtils.ProtParam import ProteinAnalysis
 
 # IUPAC alphabets (including ambiguous symbols)
@@ -284,6 +285,105 @@ def search_exact_sequence_in_ncbi(seq: str, seq_type: str, retmax: int = 5) -> D
     }
 
 
+def blast_similarity_search(seq: str, seq_type: str, hitlist_size: int = 10) -> Dict:
+    """
+    Run NCBI BLAST similarity search and return alignment-derived hit metrics.
+
+    Why this is needed:
+    Users may submit only a raw sequence (no accession), so sequence-similarity
+    alignment is required before deciding whether the sequence is already known.
+    """
+    if seq_type in {"DNA", "RNA", "NUCLEIC_ACID_AMBIGUOUS"}:
+        program = "blastn"
+        database = "nt"
+    elif seq_type == "PROTEIN":
+        program = "blastp"
+        database = "nr"
+    else:
+        return {"status": "skipped", "reason": "Unknown sequence type"}
+
+    handle = NCBIWWW.qblast(
+        program=program,
+        database=database,
+        sequence=seq,
+        hitlist_size=hitlist_size,
+        format_type="XML",
+    )
+    blast_record = NCBIXML.read(handle)
+
+    hits = []
+    for aln in blast_record.alignments[:hitlist_size]:
+        if not aln.hsps:
+            continue
+        hsp = aln.hsps[0]
+        identity_pct = (100.0 * hsp.identities / hsp.align_length) if hsp.align_length else 0.0
+        coverage_pct = (100.0 * hsp.align_length / max(1, len(seq)))
+        hits.append(
+            {
+                "accession": aln.accession,
+                "title": aln.title,
+                "length": aln.length,
+                "score": hsp.score,
+                "evalue": hsp.expect,
+                "identity_pct": round(identity_pct, 3),
+                "query_coverage_pct": round(min(coverage_pct, 100.0), 3),
+                "query_alignment": hsp.query,
+                "match_alignment": hsp.match,
+                "subject_alignment": hsp.sbjct,
+            }
+        )
+
+    if not hits:
+        return {
+            "status": "novel",
+            "program": program,
+            "database": database,
+            "message": "No significant BLAST hits found.",
+            "hits": [],
+        }
+
+    best = hits[0]
+    known = best["identity_pct"] >= 99.0 and best["query_coverage_pct"] >= 95.0
+    return {
+        "status": "found" if known else "candidate_novel",
+        "program": program,
+        "database": database,
+        "decision": (
+            "Sequence likely already represented in NCBI (high identity + coverage)."
+            if known
+            else "No near-exact full-length hit; sequence may be novel/variant."
+        ),
+        "best_hit": best,
+        "hits": hits,
+    }
+
+
+def fetch_accession_summaries(accessions: Sequence[str], seq_type: str) -> List[Dict]:
+    """Fetch Entrez summaries for BLAST hit accessions."""
+    if not accessions:
+        return []
+    db = "protein" if seq_type == "PROTEIN" else "nuccore"
+    with Entrez.esearch(db=db, term=" OR ".join(f"{acc}[Accession]" for acc in accessions), retmax=len(accessions)) as h:
+        res = Entrez.read(h)
+    ids = res.get("IdList", [])
+    if not ids:
+        return []
+    with Entrez.esummary(db=db, id=",".join(ids), retmode="xml") as h:
+        docs = Entrez.read(h)
+    out = []
+    for doc in docs:
+        out.append(
+            {
+                "id": str(doc.get("Id", "")),
+                "accession": str(doc.get("Caption", "")),
+                "title": str(doc.get("Title", "")),
+                "organism": str(doc.get("Organism", "")),
+                "length": str(doc.get("Length", "")),
+            }
+        )
+    return out
+
+
 def fetch_genbank_details(db: str, ids: Sequence[str], limit: int = 3) -> List[Dict]:
     """Fetch richer annotations including authors from GenBank records."""
     out: List[Dict] = []
@@ -388,16 +488,23 @@ def run_pipeline() -> None:
     print("\n=== NCBI LOOKUP ===")
     for (rid, seq), qc in zip(records, qc_results):
         print(f"\nRecord: {rid}")
-        result = search_exact_sequence_in_ncbi(seq=seq, seq_type=qc.seq_type)
-        print(json.dumps(result, indent=2))
+        print("Running BLAST alignment search (MSA-style evidence from top hits)...")
+        blast_result = blast_similarity_search(seq=seq, seq_type=qc.seq_type, hitlist_size=5)
+        print(json.dumps(blast_result, indent=2))
 
-        if result.get("status") == "found":
-            db = result["db"]
-            details = fetch_genbank_details(db=db, ids=result.get("ids", []), limit=3)
+        if blast_result.get("hits"):
+            top_accessions = [h["accession"] for h in blast_result["hits"][:3] if h.get("accession")]
+            summaries = fetch_accession_summaries(top_accessions, qc.seq_type)
+            print("NCBI summaries for top alignment hits:")
+            print(json.dumps(summaries, indent=2))
+
+            db = "protein" if qc.seq_type == "PROTEIN" else "nuccore"
+            ids = [s["id"] for s in summaries if s.get("id")]
+            details = fetch_genbank_details(db=db, ids=ids, limit=3)
             print("Detailed annotations (subset):")
             print(json.dumps(details, indent=2, default=str))
-        elif result.get("status") == "novel":
-            print("Interpretation: sequence appears novel based on this exact-match query.")
+        else:
+            print("Interpretation: no significant alignment hit; sequence is likely novel.")
 
 
 if __name__ == "__main__":
