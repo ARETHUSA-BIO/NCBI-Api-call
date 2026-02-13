@@ -1,6 +1,6 @@
 # NCBI Sequence QC & Annotation Pipeline
 
-Prepared for **eng. Taha bilel chalbi**.
+Prepared by Taha bilel chalbi**.
 
 A short, Colab-ready pipeline to:
 - read FASTA,
@@ -102,5 +102,3 @@ The script uses alignment evidence (not accession-only exact lookup):
 - `README.md`
 
 ---
-
-Requested name included: **eng. Taha bilel chalbi**.
